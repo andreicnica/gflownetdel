@@ -138,6 +138,8 @@ class DemoModel(nn.Module):
             nn.ReLU(),
             nn.Linear(h_size, h_size),
             nn.ReLU(),
+            nn.Linear(h_size, h_size),
+            nn.ReLU(),
         )
         self.actor = nn.Linear(h_size, act_space)
         self.value = nn.Linear(h_size, 1)
@@ -240,7 +242,7 @@ class Dataset:
                 arnd = self.np_rng.rand() > eps
                 send_act = act[ix].item() if arnd else np.random.randint(len(obss[ix]["av_blocks"]))
                 next_obs, r, done, info = env.step(send_act)
-                env_traj[ix].append(Transition(obss[ix], act[ix], r, done, info, next_obs))
+                env_traj[ix].append(Transition(obss[ix], send_act, r, done, info, next_obs))
 
                 if done:
                     trajs.append(env_traj[ix])
@@ -359,6 +361,7 @@ TRAINER_BATCH_TRANSFORM = {
 
 
 # %% GFN Trainer - train step and loss construction methods.
+#  Original GFlowNet - using TD sum(inflow) - sum(outflow)
 class GFNTrainer:
     def __init__(self, args: Namespace, model, dataset, s2b, device, floatX):
         self.model = model
@@ -475,6 +478,90 @@ class GFNTrainer:
         return {"s_corr": evals.correlation, "s_pvalue": evals.pvalue}
 
 
+# %% Alternative GflowNet - detailed balance Flow(s') =  P(s->s') * F(s)
+class GFNTrainerDetailedBalance(GFNTrainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def loss(self, batch):
+        """ Compute loss for batch of transitions """
+
+        model = self.model
+        args = self.args
+
+        donef = batch.done.to(self.floatX)
+
+        # parents of the state outputs
+        mol_out_obs, stem_out_obs = model(batch.obs)
+        mol_out_nobs, stem_out_nobs = model(batch.next_obs)
+
+        # log(P(s->s'))
+        log_prob = model.log_probs(batch.obs, stem_out_obs, batch.act)
+
+        # log(P(s->s')) + log(F(s)) - 1 parent for tree
+        inflow = mol_out_obs.squeeze(1) + log_prob
+
+        outflow_plus_r = mol_out_nobs.squeeze(1)
+        outflow_plus_r[batch.done] = torch.log(batch.reward[batch.done])
+
+        losses = _losses = (inflow - outflow_plus_r).pow(2)
+
+        term_loss = (losses * donef).sum() / (donef.sum() + 1e-20)
+        flow_loss = (losses * (1-donef)).sum() / ((1-donef).sum() + 1e-20)
+
+        if args.balanced_loss:
+            # Help to focus more on having the correct loss on terminal state value prediction
+            loss = term_loss * args.leaf_coef + flow_loss
+        else:
+            loss = losses.mean()
+
+        info = {
+            **run_stats("term_loss", term_loss.data.cpu().numpy()),
+            **run_stats("flow_loss", flow_loss.data.cpu().numpy()),
+            **run_stats("losses", losses.data.cpu().numpy()),
+        }
+        return loss, info
+
+
+# %% Alternative Trajectory reinforce - might overfit too much to training data,
+# and propose less diverse
+class TrajReinforce(GFNTrainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Rewards should need to be normalized and centered in 0 for reinforce
+        # We compute a running mean here
+        self._mreward = 0.2
+
+    def loss(self, batch):
+        """ Compute loss for batch of transitions """
+
+        model = self.model
+        args = self.args
+
+        donef = batch.done.to(self.floatX)
+
+        # parents of the state outputs
+        mol_out_obs, stem_out_obs = model(batch.obs)
+
+        # log(P(s->s'))
+        log_prob = model.log_probs(batch.obs, stem_out_obs, batch.act)
+        seq_log_prob = torch.zeros(batch.seq.max() + 1, device=self.device, dtype=self.floatX)
+        seq_log_prob.index_add_(0, batch.seq, log_prob)
+
+        # Reinforce log probability of a trajectory based on the Reward - baseline
+        tgt_r = batch.reward[batch.done] * 10
+        self._mreward = self._mreward * 0.98 + 0.02 * (tgt_r.mean().item())
+        reinf = tgt_r - self._mreward
+        losses = _losses = - seq_log_prob * reinf
+
+        loss = losses.mean()
+
+        info = {
+            **run_stats("losses", losses.data.cpu().numpy()),
+        }
+        return loss, info
+
+
 def main(args):
     device = torch.device('cuda') if args.use_cuda and torch.cuda.is_available() else torch.device("cpu")
     floatX = getattr(torch, args.floatX)
@@ -485,6 +572,8 @@ def main(args):
     model.to(device)
     dataset = Dataset(args.dataset, model, env_class, s2b, device, floatX)
     trainer = GFNTrainer(args.trainer, model, dataset, s2b, device, floatX=floatX)
+    # trainer = GFNTrainerDetailedBalance(args.trainer, model, dataset, s2b, device, floatX=floatX)
+    # trainer = TrajReinforce(args.trainer, model, dataset, s2b, device, floatX=floatX)
 
     # ==============================================================================================
     # -- offline load
@@ -548,12 +637,16 @@ good_config = {
         "num_envs_procs": 8,
         "full_history_size": 10000,  # Trajectories to keep in buffer
         "best_history_size": 10000,  # Terminal Transitions to keep in buffer (highest scoring ones)
-        'train_batch_new_f': 0.5,
-        'random_action_prob': 0.05,
+        'train_batch_new_f': 0.5,  # Fraction of training batch to use new samples from model
+        #  (new trajectories). 1-train_batch_new_f we will sample backward from offline batch
+        #  1 - means sample online new trajectories. 0 means using only offline backward samples
+        #  from buffer
+        'random_action_prob': 0.05,  # for training Sample with x*100% probability a random action
+        # when getting new trajectories from model
     },
     "trainer": {
-        "trainer_batch_transform": "batch2trainbatch",
-        "mbsize": 16,
+        "trainer_batch_transform": "batch2trainbatch",  # Use this to construct trainer batch info
+        "mbsize": 256,  # Training batch size
 
         # This args are used to make train reward roughly between 0 and 2.
         # TODO reward shaping for GflowNet training is very important!
@@ -566,7 +659,7 @@ good_config = {
 
         "optim": "Adam",
         "optim_args": {
-            "lr": 5e-4,
+            "lr": 5.e-4,
             'betas': (0.9, 0.999),  # Optimization seems very sensitive to this, default value works
             "eps": 1.e-8,
         },
