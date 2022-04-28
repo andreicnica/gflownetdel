@@ -1,3 +1,8 @@
+# run with 
+`python gflownet_del.py`
+
+Everything is in `gflownet_del.py` and `utils_del.py`.
+
 # Flow Network based Generative Models for Non-Iterative Diverse Candidate Generation
 
 Implementation for [our paper](https://arxiv.org/abs/2106.04399), submitted to NeurIPS 2021 (also check this high-level [blog post](http://folinoid.com/w/gflownet)).
